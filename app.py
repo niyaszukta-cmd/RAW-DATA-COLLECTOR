@@ -33,10 +33,7 @@ CKPT_PATH = "hedgex_collector_ckpt.json"
 # ── MASTER CONFIG — update token here when it expires ─────────────────────────
 DHAN_CLIENT_ID    = "1100480354"
 DHAN_ACCESS_TOKEN = (
-    "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9"
-    ".eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzc1NjMyMDMyLCJhcHBfaWQiOiJhYjYxZmJmOSIs"
-    "ImlhdCI6MTc3NTU0NTYzMiwidG9rZW5Db25zdW1lclR5cGUiOiJBUFAiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwMDQ4MDM1NCJ9"
-    ".6mLI3OTxCjgy4oEvqtjKG1BUgP3OLWuenA011y-FXfXQZbpnmZ_aeBjWMu5c-DKzhPUfLQZPVtUr2eQ7_-lmDQ"
+   "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzc2MzY2NTEzLCJhcHBfaWQiOiJhYjYxZmJmOSIsImlhdCI6MTc3NjI4MDExMywidG9rZW5Db25zdW1lclR5cGUiOiJBUFAiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwMDQ4MDM1NCJ9.tWhBYSbeNT25V9OJcK3mdV1OHorASWlX_GH-iwNSfmKcY-6PB6hJDHenzZC6-mvrLcOZ3LgVUp8oAtQopwcovQ"
 )
 
 DHAN_INDEX_SECURITY_IDS = {
