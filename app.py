@@ -33,7 +33,7 @@ CKPT_PATH = "hedgex_collector_ckpt.json"
 # ── MASTER CONFIG — update token here when it expires ─────────────────────────
 DHAN_CLIENT_ID    = "1100480354"
 DHAN_ACCESS_TOKEN = (
-   "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzc2MzY2NTEzLCJhcHBfaWQiOiJhYjYxZmJmOSIsImlhdCI6MTc3NjI4MDExMywidG9rZW5Db25zdW1lclR5cGUiOiJBUFAiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwMDQ4MDM1NCJ9.tWhBYSbeNT25V9OJcK3mdV1OHorASWlX_GH-iwNSfmKcY-6PB6hJDHenzZC6-mvrLcOZ3LgVUp8oAtQopwcovQ"
+    "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzc2MzY2NTEzLCJhcHBfaWQiOiJhYjYxZmJmOSIsImlhdCI6MTc3NjI4MDExMywidG9rZW5Db25zdW1lclR5cGUiOiJBUFAiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwMDQ4MDM1NCJ9.tWhBYSbeNT25V9OJcK3mdV1OHorASWlX_GH-iwNSfmKcY-6PB6hJDHenzZC6-mvrLcOZ3LgVUp8oAtQopwcovQ"
 )
 
 DHAN_INDEX_SECURITY_IDS = {
@@ -2420,15 +2420,29 @@ def main():
                                 ORDER BY trade_date, timestamp""",
                                 con, params=(exp_symbol, exp_from, exp_to,
                                              expiry_code, expiry_flag, interval_min))
-                            # Join on trade_date + timestamp
-                            # raw: per strike per bar  →  derived: per bar
-                            # Left join so raw keeps all strikes, derived cols repeat per bar
-                            drv_nocols = [c for c in df_drv.columns
-                                          if c not in ("id","symbol","trade_date",
-                                                        "expiry_code","expiry_flag",
-                                                        "interval_min","spot_price")]
+                            # Columns to carry from derived — exclude identity cols
+                            # already in raw to prevent _x/_y suffix conflicts
+                            _raw_cols_set = set(df_raw.columns)
+                            drv_nocols = [
+                                c for c in df_drv.columns
+                                if c not in ("id","symbol","trade_date","timestamp",
+                                             "expiry_code","expiry_flag",
+                                             "interval_min","spot_price")
+                                and c not in _raw_cols_set
+                            ]
+                            # Deduplicate derived on (trade_date, timestamp):
+                            # multiple rows exist when different expiry_code/flag
+                            # combos were computed. Already filtered above by sidebar
+                            # selectors so duplicates are rare — keep first row.
+                            df_drv_dedup = (
+                                df_drv[["trade_date","timestamp"] + drv_nocols]
+                                .drop_duplicates(subset=["trade_date","timestamp"])
+                                .reset_index(drop=True)
+                            )
+                            # Left join: every raw row (per strike per bar) gets
+                            # bar-level derived cols appended alongside it
                             df_exp = df_raw.merge(
-                                df_drv[["trade_date","timestamp"] + drv_nocols],
+                                df_drv_dedup,
                                 on=["trade_date","timestamp"],
                                 how="left")
 
