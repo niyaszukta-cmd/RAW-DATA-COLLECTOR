@@ -106,6 +106,31 @@ class BS:
             return -norm.pdf(d1) * d2 / sigma
         except: return 0.0
 
+    @staticmethod
+    def charm(S, K, T, r, sigma, is_call=True):
+        """∂Δ/∂t — rate of delta change with time (per day).
+        Also called delta decay. Sign: positive = delta rises with time.
+        charm = -N'(d1) × [2rT - d2·σ√T] / (2T·σ√T)
+        """
+        if T <= 0 or sigma <= 0 or S <= 0 or K <= 0: return 0.0
+        try:
+            d1  = BS._d1(S, K, T, r, sigma)
+            d2  = BS._d2(S, K, T, r, sigma)
+            num = 2 * r * T - d2 * sigma * np.sqrt(T)
+            ch  = -norm.pdf(d1) * num / (2 * T * sigma * np.sqrt(T))
+            return ch if is_call else -ch
+        except: return 0.0
+
+    @staticmethod
+    def delta(S, K, T, r, sigma, is_call=True):
+        """Standard Black-Scholes delta."""
+        if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+            return (1.0 if is_call else 0.0) if S >= K else (0.0 if is_call else -1.0)
+        try:
+            d1 = BS._d1(S, K, T, r, sigma)
+            return norm.cdf(d1) if is_call else norm.cdf(d1) - 1.0
+        except: return 0.0
+
 # ── API header ────────────────────────────────────────────────────────────────
 def get_headers() -> Dict:
     return {
@@ -158,6 +183,61 @@ def init_db():
             call_vanna_greek REAL,
             put_vanna_greek  REAL,
             UNIQUE(symbol, trade_date, timestamp, strike_type, expiry_code, expiry_flag)
+        )""")
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS derived_snapshots (
+            id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol                TEXT,
+            trade_date            TEXT,
+            timestamp             TEXT,
+            expiry_code           INTEGER,
+            expiry_flag           TEXT,
+            interval_min          TEXT,
+            spot_price            REAL,
+            -- IV metrics
+            avg_iv                REAL,
+            atm_iv                REAL,
+            iv_skew               REAL,
+            iv_change             REAL,
+            iv_regime             TEXT,
+            iv_term_structure     REAL,
+            -- OI metrics
+            total_call_oi         REAL,
+            total_put_oi          REAL,
+            pcr_oi                REAL,
+            pcr_volume            REAL,
+            max_pain              REAL,
+            call_oi_concentration REAL,
+            put_oi_concentration  REAL,
+            oi_buildup_signal     TEXT,
+            -- GEX derivatives
+            net_gex_total         REAL,
+            cumulative_gex_above  REAL,
+            cumulative_gex_below  REAL,
+            gex_flip_level        REAL,
+            gex_skew              REAL,
+            largest_gex_strike    REAL,
+            -- VANNA derivatives
+            net_vanna_total       REAL,
+            vacuum_zone_level     REAL,
+            trap_door_level       REAL,
+            support_floor_level   REAL,
+            resistance_ceil_level REAL,
+            vanna_skew            REAL,
+            -- Enhanced OI VANNA (flow)
+            net_flow_vanna_total  REAL,
+            -- Cascade mathematics
+            bear_fuel_pts         REAL,
+            bear_absorb_pts       REAL,
+            bull_fuel_pts         REAL,
+            bull_absorb_pts       REAL,
+            bear_quality          REAL,
+            bull_quality          REAL,
+            cascade_direction     TEXT,
+            estimated_cascade_pts REAL,
+            -- Charm
+            net_charm_total       REAL,
+            UNIQUE(symbol, trade_date, timestamp, expiry_code, expiry_flag, interval_min)
         )""")
     con.execute("""
         CREATE TABLE IF NOT EXISTS fetch_log (
@@ -500,6 +580,367 @@ def get_trading_dates(start: date, end: date) -> List[str]:
     return dates
 
 # ── Main ──────────────────────────────────────────────────────────────────────
+# ── Derivatives computation ───────────────────────────────────────────────────
+
+def _vanna_flip_zones(df_ts, spot):
+    """Identify all VANNA flip zones from net_vanna sign changes."""
+    df_s = df_ts.sort_values("strike").reset_index(drop=True)
+    zones = []
+    for i in range(len(df_s) - 1):
+        cv = df_s.iloc[i]["net_vanna"]
+        nv = df_s.iloc[i+1]["net_vanna"]
+        ck = df_s.iloc[i]["strike"]
+        nk = df_s.iloc[i+1]["strike"]
+        if cv * nv < 0:
+            w      = abs(cv) / (abs(cv) + abs(nv) + 1e-12)
+            flip_k = ck + (nk - ck) * w
+            ftype  = "NEG_TO_POS" if cv < 0 else "POS_TO_NEG"
+            above  = flip_k > spot
+            if   above  and ftype == "NEG_TO_POS": role = "VACUUM_ZONE"
+            elif above  and ftype == "POS_TO_NEG": role = "RESISTANCE_CEILING"
+            elif not above and ftype == "POS_TO_NEG": role = "TRAP_DOOR"
+            else:                                   role = "SUPPORT_FLOOR"
+            zones.append({"strike": round(flip_k, 2), "role": role,
+                          "magnitude": round((abs(cv)+abs(nv))/2, 6)})
+    return zones
+
+
+def _gex_flip_level(df_ts, spot):
+    """Linear interpolation of the gamma flip level (net_gex = 0 crossing)."""
+    df_s = df_ts.sort_values("strike").reset_index(drop=True)
+    for i in range(len(df_s) - 1):
+        g1 = df_s.iloc[i]["net_gex"]
+        g2 = df_s.iloc[i+1]["net_gex"]
+        k1 = df_s.iloc[i]["strike"]
+        k2 = df_s.iloc[i+1]["strike"]
+        if g1 * g2 < 0:
+            w = abs(g1) / (abs(g1) + abs(g2) + 1e-12)
+            return round(k1 + (k2 - k1) * w, 2)
+    return None
+
+
+def _max_pain(df_ts):
+    """
+    Max pain = strike that minimises total option dollar value at expiry.
+    For each candidate strike S:
+      call_pain = Σ max(S - K, 0) × call_oi   for all K < S
+      put_pain  = Σ max(K - S, 0) × put_oi    for all K > S
+      total_pain = call_pain + put_pain
+    Return S with minimum total_pain.
+    """
+    strikes = sorted(df_ts["strike"].unique())
+    if len(strikes) < 2:
+        return None
+    min_pain = float("inf")
+    max_pain_strike = strikes[0]
+    for s in strikes:
+        call_pain = df_ts[df_ts["strike"] < s].apply(
+            lambda r: max(s - r["strike"], 0) * r["call_oi"], axis=1).sum()
+        put_pain  = df_ts[df_ts["strike"] > s].apply(
+            lambda r: max(r["strike"] - s, 0) * r["put_oi"],  axis=1).sum()
+        total = call_pain + put_pain
+        if total < min_pain:
+            min_pain = total
+            max_pain_strike = s
+    return float(max_pain_strike)
+
+
+def _enhanced_oi_vanna(df_ts, spot, contract_size, scaling, tte):
+    """
+    Flow VANNA = call_oi_chg × call_vanna_greek × vol_weight × iv_adj × dist_weight × spot × lot / scale
+    Uses OI CHANGE (not total OI) — measures intraday dealer flow.
+    """
+    total_vol = max(df_ts["call_vol"].sum() + df_ts["put_vol"].sum(), 1.0)
+    vals = []
+    for _, row in df_ts.iterrows():
+        try:
+            strike = row["strike"]
+            civ = max(row["call_iv"]/100 if row["call_iv"] > 1 else row["call_iv"], 0.01)
+            piv = max(row["put_iv"] /100 if row["put_iv"]  > 1 else row["put_iv"],  0.01)
+            cv  = BS.vanna(spot, strike, tte, RISK_FREE, civ)
+            pv  = BS.vanna(spot, strike, tte, RISK_FREE, piv)
+            vw  = 1.0 + (row["call_vol"] + row["put_vol"]) / total_vol
+            iv_adj = 1.0 + ((civ + piv) / 2 * 3)
+            dw  = 1.0 / (1 + abs(strike - spot) / spot * 1.5)
+            eov = (
+                (row["call_oi_chg"] * cv * 2.0 * vw * iv_adj * dw * spot * contract_size) / scaling +
+                (row["put_oi_chg"]  * pv * 2.0 * vw * iv_adj * dw * spot * contract_size) / scaling
+            )
+            vals.append(eov)
+        except:
+            vals.append(0.0)
+    return vals
+
+
+def _cascade_pts(df_ts, spot, symbol):
+    """Fuel/Absorption cascade mathematics per snapshot."""
+    ppu_map = {
+        "NIFTY": 0.010, "BANKNIFTY": 0.033,
+        "FINNIFTY": 0.050, "MIDCPNIFTY": 0.050, "SENSEX": 0.025,
+    }
+    cap_map = {
+        "NIFTY": 150, "BANKNIFTY": 300,
+        "FINNIFTY": 150, "MIDCPNIFTY": 75, "SENSEX": 500,
+    }
+    ppu = ppu_map.get(symbol, 0.010)
+    cap = cap_map.get(symbol, 150)
+    bf = ba = uf = ua = 0.0
+    for _, row in df_ts.iterrows():
+        s   = row["strike"]
+        gex = row["net_gex"]
+        rp  = min(abs(gex) * ppu, cap)
+        if s < spot:
+            if gex < 0: bf += rp
+            else:        ba += rp
+        else:
+            if gex < 0: uf += rp
+            else:        ua += rp
+    bq   = bf / max(ba, 1.0)
+    uq   = uf / max(ua, 1.0)
+    net_bear = max(0, bf - ba * 0.5)
+    net_bull = max(0, uf - ua * 0.5)
+    if bq >= uq and max(bq, uq) >= 0.5:
+        direction = "BEAR"
+        est_pts   = -net_bear
+    elif uq > bq and max(bq, uq) >= 0.5:
+        direction = "BULL"
+        est_pts   = net_bull
+    else:
+        direction = "NONE"
+        est_pts   = 0.0
+    return {
+        "bear_fuel_pts":     round(bf,  2),
+        "bear_absorb_pts":   round(ba,  2),
+        "bull_fuel_pts":     round(uf,  2),
+        "bull_absorb_pts":   round(ua,  2),
+        "bear_quality":      round(bq,  4),
+        "bull_quality":      round(uq,  4),
+        "cascade_direction": direction,
+        "estimated_cascade_pts": round(est_pts, 2),
+    }
+
+
+def compute_derivatives_for_day(df_day, symbol, trade_date,
+                                  expiry_code, expiry_flag, interval_min):
+    """
+    Compute all derived metrics from raw chain data for one trading day.
+    Returns list of dicts — one dict per timestamp (bar-level snapshot).
+    """
+    cfg           = INDEX_CONFIG.get(symbol, {})
+    contract_size = cfg.get("contract_size", 25)
+    scaling       = 1e9
+    tte           = 7 / 365 if expiry_flag == "WEEK" else 30 / 365
+
+    timestamps  = sorted(df_day["timestamp"].unique())
+    prev_avg_iv = None
+    results     = []
+
+    for ts in timestamps:
+        df_ts = df_day[df_day["timestamp"] == ts].copy()
+        if df_ts.empty:
+            continue
+
+        spot = float(df_ts["spot_price"].mean())
+
+        # ── IV metrics ────────────────────────────────────────────────────────
+        avg_iv   = float((df_ts["call_iv"].mean() + df_ts["put_iv"].mean()) / 2)
+        iv_change = float(avg_iv - prev_avg_iv) if prev_avg_iv is not None else 0.0
+        prev_avg_iv = avg_iv
+
+        # IV regime
+        thr = 0.15  # % IV change threshold
+        if   iv_change >  thr: iv_regime = "EXPANDING"
+        elif iv_change < -thr: iv_regime = "COMPRESSING"
+        else:                   iv_regime = "FLAT"
+
+        # ATM IV — closest strike to spot
+        df_ts["dist"] = (df_ts["strike"] - spot).abs()
+        atm_row = df_ts.loc[df_ts["dist"].idxmin()]
+        atm_iv  = float((atm_row["call_iv"] + atm_row["put_iv"]) / 2)
+        iv_skew = float(atm_row["put_iv"] - atm_row["call_iv"])
+
+        # IV term structure: ATM vs 2-strikes-OTM average
+        otm_rows = df_ts[df_ts["dist"] >= 2 * cfg.get("strike_interval", 50)]
+        iv_term_structure = float(
+            (otm_rows["call_iv"].mean() + otm_rows["put_iv"].mean()) / 2 - atm_iv
+        ) if len(otm_rows) > 0 else 0.0
+
+        # ── OI metrics ────────────────────────────────────────────────────────
+        total_call_oi   = float(df_ts["call_oi"].sum())
+        total_put_oi    = float(df_ts["put_oi"].sum())
+        pcr_oi          = round(total_put_oi / max(total_call_oi, 1), 4)
+        total_call_vol  = float(df_ts["call_vol"].sum())
+        total_put_vol   = float(df_ts["put_vol"].sum())
+        pcr_volume      = round(total_put_vol / max(total_call_vol, 1), 4)
+
+        # Max pain
+        max_pain_strike = _max_pain(df_ts)
+
+        # OI concentration
+        call_oi_conc = float(df_ts["call_oi"].max() / max(total_call_oi, 1) * 100)
+        put_oi_conc  = float(df_ts["put_oi"].max()  / max(total_put_oi,  1) * 100)
+
+        # OI buildup signal — compare spot move to total OI change direction
+        total_oi_chg = float(
+            df_ts["call_oi_chg"].sum() + df_ts["put_oi_chg"].sum())
+        if   total_oi_chg > 0 and spot >= (prev_avg_iv or spot): oi_buildup = "LONG_BUILDUP"
+        elif total_oi_chg > 0 and spot <  (prev_avg_iv or spot): oi_buildup = "SHORT_BUILDUP"
+        elif total_oi_chg < 0 and spot >= (prev_avg_iv or spot): oi_buildup = "SHORT_COVERING"
+        elif total_oi_chg < 0 and spot <  (prev_avg_iv or spot): oi_buildup = "LONG_UNWINDING"
+        else:                                                       oi_buildup = "NEUTRAL"
+
+        # ── GEX derivatives ───────────────────────────────────────────────────
+        net_gex_total        = float(df_ts["net_gex"].sum())
+        cumulative_gex_above = float(df_ts[df_ts["strike"] > spot]["net_gex"].sum())
+        cumulative_gex_below = float(df_ts[df_ts["strike"] < spot]["net_gex"].sum())
+        gex_skew             = round(
+            cumulative_gex_above / max(abs(cumulative_gex_below), 1e-9), 4)
+        gex_flip_lvl         = _gex_flip_level(df_ts, spot)
+        largest_gex_row      = df_ts.loc[df_ts["net_gex"].abs().idxmax()]
+        largest_gex_strike   = float(largest_gex_row["strike"])
+
+        # ── VANNA derivatives ─────────────────────────────────────────────────
+        net_vanna_total = float(df_ts["net_vanna"].sum())
+        vanna_above     = float(df_ts[df_ts["strike"] > spot]["net_vanna"].sum())
+        vanna_below     = float(df_ts[df_ts["strike"] < spot]["net_vanna"].sum())
+        vanna_skew      = round(vanna_above / max(abs(vanna_below), 1e-9), 4)
+
+        vz = _vanna_flip_zones(df_ts, spot)
+        vacuum_zone_lvl   = next((z["strike"] for z in vz if z["role"] == "VACUUM_ZONE"),      None)
+        trap_door_lvl     = next((z["strike"] for z in vz if z["role"] == "TRAP_DOOR"),         None)
+        support_floor_lvl = next((z["strike"] for z in vz if z["role"] == "SUPPORT_FLOOR"),     None)
+        resistance_lvl    = next((z["strike"] for z in vz if z["role"] == "RESISTANCE_CEILING"),None)
+
+        # ── Enhanced OI VANNA (flow) ──────────────────────────────────────────
+        eov_vals         = _enhanced_oi_vanna(df_ts, spot, contract_size, scaling, tte)
+        net_flow_vanna   = float(sum(eov_vals))
+
+        # ── Cascade mathematics ───────────────────────────────────────────────
+        cas = _cascade_pts(df_ts, spot, symbol)
+
+        # ── Charm ─────────────────────────────────────────────────────────────
+        net_charm = 0.0
+        for _, row in df_ts.iterrows():
+            try:
+                k   = row["strike"]
+                civ = max(row["call_iv"]/100 if row["call_iv"] > 1 else row["call_iv"], 0.01)
+                piv = max(row["put_iv"] /100 if row["put_iv"]  > 1 else row["put_iv"],  0.01)
+                cc  = BS.charm(spot, k, tte, RISK_FREE, civ, is_call=True)
+                pc  = BS.charm(spot, k, tte, RISK_FREE, piv, is_call=False)
+                net_charm += (row["call_oi"] * cc + row["put_oi"] * pc) * spot * contract_size / scaling
+            except:
+                pass
+
+        results.append({
+            "symbol":        symbol,
+            "trade_date":    trade_date,
+            "timestamp":     ts.strftime("%Y-%m-%d %H:%M:%S") if hasattr(ts, "strftime") else str(ts),
+            "expiry_code":   expiry_code,
+            "expiry_flag":   expiry_flag,
+            "interval_min":  interval_min,
+            "spot_price":    round(spot, 2),
+            # IV
+            "avg_iv":                round(avg_iv, 4),
+            "atm_iv":                round(atm_iv, 4),
+            "iv_skew":               round(iv_skew, 4),
+            "iv_change":             round(iv_change, 4),
+            "iv_regime":             iv_regime,
+            "iv_term_structure":     round(iv_term_structure, 4),
+            # OI
+            "total_call_oi":         round(total_call_oi, 0),
+            "total_put_oi":          round(total_put_oi,  0),
+            "pcr_oi":                pcr_oi,
+            "pcr_volume":            pcr_volume,
+            "max_pain":              max_pain_strike,
+            "call_oi_concentration": round(call_oi_conc, 2),
+            "put_oi_concentration":  round(put_oi_conc,  2),
+            "oi_buildup_signal":     oi_buildup,
+            # GEX
+            "net_gex_total":         round(net_gex_total, 6),
+            "cumulative_gex_above":  round(cumulative_gex_above, 6),
+            "cumulative_gex_below":  round(cumulative_gex_below, 6),
+            "gex_flip_level":        gex_flip_lvl,
+            "gex_skew":              gex_skew,
+            "largest_gex_strike":    largest_gex_strike,
+            # VANNA
+            "net_vanna_total":       round(net_vanna_total, 6),
+            "vacuum_zone_level":     vacuum_zone_lvl,
+            "trap_door_level":       trap_door_lvl,
+            "support_floor_level":   support_floor_lvl,
+            "resistance_ceil_level": resistance_lvl,
+            "vanna_skew":            vanna_skew,
+            # Flow VANNA
+            "net_flow_vanna_total":  round(net_flow_vanna, 6),
+            # Cascade
+            **cas,
+            # Charm
+            "net_charm_total":       round(net_charm, 6),
+        })
+
+    return results
+
+
+def save_derived(rows: List[Dict]):
+    if not rows: return
+    con = sqlite3.connect(DB_PATH)
+    con.executemany("""
+        INSERT OR REPLACE INTO derived_snapshots (
+            symbol, trade_date, timestamp, expiry_code, expiry_flag, interval_min,
+            spot_price,
+            avg_iv, atm_iv, iv_skew, iv_change, iv_regime, iv_term_structure,
+            total_call_oi, total_put_oi, pcr_oi, pcr_volume, max_pain,
+            call_oi_concentration, put_oi_concentration, oi_buildup_signal,
+            net_gex_total, cumulative_gex_above, cumulative_gex_below,
+            gex_flip_level, gex_skew, largest_gex_strike,
+            net_vanna_total, vacuum_zone_level, trap_door_level,
+            support_floor_level, resistance_ceil_level, vanna_skew,
+            net_flow_vanna_total,
+            bear_fuel_pts, bear_absorb_pts, bull_fuel_pts, bull_absorb_pts,
+            bear_quality, bull_quality, cascade_direction, estimated_cascade_pts,
+            net_charm_total
+        ) VALUES (
+            :symbol, :trade_date, :timestamp, :expiry_code, :expiry_flag, :interval_min,
+            :spot_price,
+            :avg_iv, :atm_iv, :iv_skew, :iv_change, :iv_regime, :iv_term_structure,
+            :total_call_oi, :total_put_oi, :pcr_oi, :pcr_volume, :max_pain,
+            :call_oi_concentration, :put_oi_concentration, :oi_buildup_signal,
+            :net_gex_total, :cumulative_gex_above, :cumulative_gex_below,
+            :gex_flip_level, :gex_skew, :largest_gex_strike,
+            :net_vanna_total, :vacuum_zone_level, :trap_door_level,
+            :support_floor_level, :resistance_ceil_level, :vanna_skew,
+            :net_flow_vanna_total,
+            :bear_fuel_pts, :bear_absorb_pts, :bull_fuel_pts, :bull_absorb_pts,
+            :bear_quality, :bull_quality, :cascade_direction, :estimated_cascade_pts,
+            :net_charm_total
+        )""", rows)
+    con.commit()
+    con.close()
+
+
+def get_derived_dates(symbol, expiry_code, expiry_flag, interval_min):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""SELECT DISTINCT trade_date FROM derived_snapshots
+                   WHERE symbol=? AND expiry_code=? AND expiry_flag=? AND interval_min=?""",
+                (symbol, expiry_code, expiry_flag, interval_min))
+    done = {r[0] for r in cur.fetchall()}
+    con.close()
+    return done
+
+
+def load_derived(symbol, trade_date, expiry_code, expiry_flag, interval_min):
+    con = sqlite3.connect(DB_PATH)
+    df = pd.read_sql_query("""
+        SELECT * FROM derived_snapshots
+        WHERE symbol=? AND trade_date=? AND expiry_code=? AND expiry_flag=? AND interval_min=?
+        ORDER BY timestamp""",
+        con, params=(symbol, trade_date, expiry_code, expiry_flag, interval_min))
+    con.close()
+    if not df.empty:
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+    return df
+
+
 def main():
     init_db()
 
@@ -560,9 +1001,10 @@ def main():
             '</div>', unsafe_allow_html=True)
 
     # ── Tabs ──────────────────────────────────────────────────────────────────
-    tab_collect, tab_view, tab_export, tab_inspect = st.tabs([
+    tab_collect, tab_view, tab_deriv, tab_export, tab_inspect = st.tabs([
         "🚀 Collect Data",
         "🔍 View Data",
+        "⚗️ Derivatives",
         "📥 Export",
         "🔬 API Inspector",
     ])
@@ -832,8 +1274,328 @@ def main():
                     margin=dict(l=0, r=0, t=10, b=0))
                 st.plotly_chart(fig_oi, use_container_width=True)
 
+
     # ═════════════════════════════════════════════════════════════════════════
-    # TAB 3 — Export
+    # TAB 3 — Derivatives
+    # ═════════════════════════════════════════════════════════════════════════
+    with tab_deriv:
+        st.markdown("### ⚗️ Compute Derivatives from Raw Chain Data")
+
+        st.markdown("""
+        <div class="info-box">
+        Computes <b>40 derived metrics</b> from the stored raw chain data — one row per bar
+        (timestamp) per trading day. All metrics are written to the
+        <code>derived_snapshots</code> table and can be exported to CSV.<br><br>
+        <b>IV:</b> avg_iv · atm_iv · iv_skew · iv_change · iv_regime · iv_term_structure<br>
+        <b>OI:</b> pcr_oi · pcr_volume · max_pain · oi_concentration · oi_buildup_signal<br>
+        <b>GEX:</b> net_gex_total · gex_flip_level · cumulative_above/below · gex_skew<br>
+        <b>VANNA:</b> net_vanna_total · vacuum_zone · trap_door · support_floor · resistance · vanna_skew<br>
+        <b>Flow VANNA:</b> enhanced_oi_vanna (OI change weighted by greeks + IV + distance)<br>
+        <b>Cascade:</b> bear/bull fuel · absorb · quality · direction · estimated_pts<br>
+        <b>Charm:</b> net_charm_total (dealer delta decay — expiry pin force)
+        </div>""", unsafe_allow_html=True)
+
+        # Date status
+        raw_dates     = get_fetched_dates(symbol, expiry_code, expiry_flag, interval_min)
+        derived_dates = get_derived_dates(symbol, expiry_code, expiry_flag, interval_min)
+        pending_deriv = sorted(raw_dates - derived_dates)
+
+        dc1, dc2, dc3 = st.columns(3)
+        dc1.markdown(f'<div class="metric-card"><div class="metric-val">{len(raw_dates)}</div>'
+                     '<div class="metric-lbl">Raw Days Available</div></div>',
+                     unsafe_allow_html=True)
+        dc2.markdown(f'<div class="metric-card"><div class="metric-val" style="color:#10b981">'
+                     f'{len(derived_dates)}</div>'
+                     '<div class="metric-lbl">Derivatives Computed</div></div>',
+                     unsafe_allow_html=True)
+        dc3.markdown(f'<div class="metric-card"><div class="metric-val" style="color:#f59e0b">'
+                     f'{len(pending_deriv)}</div>'
+                     '<div class="metric-lbl">Pending</div></div>',
+                     unsafe_allow_html=True)
+
+        st.markdown("")
+
+        col_run, col_recomp = st.columns([3, 1])
+        run_btn     = col_run.button(
+            f"⚗️ Compute Derivatives — {len(pending_deriv)} Pending Days",
+            type="primary", use_container_width=True,
+            disabled=(len(pending_deriv) == 0))
+        recomp_btn  = col_recomp.button(
+            "🔄 Recompute All", use_container_width=True,
+            help="Recomputes derivatives for ALL collected days (overwrites existing)")
+
+        if recomp_btn:
+            con = sqlite3.connect(DB_PATH)
+            con.execute(
+                "DELETE FROM derived_snapshots WHERE symbol=? AND expiry_code=? "
+                "AND expiry_flag=? AND interval_min=?",
+                (symbol, expiry_code, expiry_flag, interval_min))
+            con.commit(); con.close()
+            pending_deriv = sorted(raw_dates)
+            st.info(f"Cleared — will recompute {len(pending_deriv)} days.")
+
+        if run_btn or recomp_btn:
+            prog   = st.progress(0)
+            status = st.empty()
+            log_bx = st.empty()
+            logs   = []
+            for idx, td in enumerate(pending_deriv):
+                status.text(f"Computing {td}  ({idx+1}/{len(pending_deriv)})")
+                df_day = load_raw_chain(symbol, td, expiry_code, expiry_flag, interval_min)
+                if df_day.empty:
+                    logs.append(f"⚠️  {td}  — no raw data found")
+                else:
+                    rows = compute_derivatives_for_day(
+                        df_day, symbol, td, expiry_code, expiry_flag, interval_min)
+                    save_derived(rows)
+                    logs.append(f"✅  {td}  →  {len(rows)} snapshots")
+                prog.progress((idx + 1) / max(len(pending_deriv), 1))
+                log_bx.text("\n".join(logs[-20:]))
+
+            prog.empty(); status.empty()
+            st.markdown(
+                '<div class="ok-box">✅ <b>Derivatives computation complete!</b> '
+                'Go to <b>Preview</b> below or <b>Export</b> tab.</div>',
+                unsafe_allow_html=True)
+            st.rerun()
+
+        # ── Preview derived snapshots ─────────────────────────────────────────
+        if derived_dates:
+            st.markdown("---")
+            st.markdown("#### 🔍 Preview Derived Snapshots")
+
+            prev_date = st.selectbox(
+                "Select Date", sorted(derived_dates, reverse=True),
+                key="deriv_prev_date")
+
+            df_deriv = load_derived(
+                symbol, prev_date, expiry_code, expiry_flag, interval_min)
+
+            if df_deriv.empty:
+                st.warning("No derived data for this date/settings.")
+            else:
+                # Metric group selector
+                groups = {
+                    "IV Metrics":     ["timestamp", "spot_price", "avg_iv", "atm_iv",
+                                       "iv_skew", "iv_change", "iv_regime",
+                                       "iv_term_structure"],
+                    "OI Metrics":     ["timestamp", "spot_price", "total_call_oi",
+                                       "total_put_oi", "pcr_oi", "pcr_volume",
+                                       "max_pain", "call_oi_concentration",
+                                       "put_oi_concentration", "oi_buildup_signal"],
+                    "GEX Derivatives":["timestamp", "spot_price", "net_gex_total",
+                                       "cumulative_gex_above", "cumulative_gex_below",
+                                       "gex_flip_level", "gex_skew",
+                                       "largest_gex_strike"],
+                    "VANNA Zones":    ["timestamp", "spot_price", "net_vanna_total",
+                                       "vacuum_zone_level", "trap_door_level",
+                                       "support_floor_level", "resistance_ceil_level",
+                                       "vanna_skew", "net_flow_vanna_total"],
+                    "Cascade Math":   ["timestamp", "spot_price",
+                                       "bear_fuel_pts", "bear_absorb_pts",
+                                       "bull_fuel_pts", "bull_absorb_pts",
+                                       "bear_quality", "bull_quality",
+                                       "cascade_direction", "estimated_cascade_pts"],
+                    "Charm":          ["timestamp", "spot_price", "net_charm_total",
+                                       "iv_regime", "cascade_direction"],
+                    "All":            [c for c in df_deriv.columns
+                                       if c not in ("id",)],
+                }
+                grp_sel = st.selectbox("Metric group", list(groups.keys()))
+                cols_sel = [c for c in groups[grp_sel] if c in df_deriv.columns]
+
+                st.dataframe(
+                    df_deriv[cols_sel],
+                    use_container_width=True, height=350, hide_index=True)
+
+                # ── Intraday charts ───────────────────────────────────────────
+                st.markdown("#### 📈 Intraday Charts")
+
+                chart_tabs = st.tabs([
+                    "IV Regime", "GEX Flip", "VANNA Zones",
+                    "PCR", "Cascade", "Charm"])
+
+                with chart_tabs[0]:
+                    fig_iv = go.Figure()
+                    fig_iv.add_trace(go.Scatter(
+                        x=df_deriv["timestamp"], y=df_deriv["avg_iv"],
+                        name="Avg IV", line=dict(color="#00d4ff", width=2)))
+                    fig_iv.add_trace(go.Scatter(
+                        x=df_deriv["timestamp"], y=df_deriv["atm_iv"],
+                        name="ATM IV", line=dict(color="#a78bfa", width=2,
+                                                  dash="dash")))
+                    # Colour background by iv_regime
+                    for _, row in df_deriv.iterrows():
+                        c = ("#ef444422" if row["iv_regime"] == "EXPANDING"
+                             else "#10b98122" if row["iv_regime"] == "COMPRESSING"
+                             else "#94a3b811")
+                        fig_iv.add_vrect(
+                            x0=row["timestamp"] - pd.Timedelta(minutes=2),
+                            x1=row["timestamp"] + pd.Timedelta(minutes=2),
+                            fillcolor=c, layer="below", line_width=0)
+                    fig_iv.update_layout(
+                        template="plotly_dark", height=350,
+                        paper_bgcolor="rgba(0,0,0,0)",
+                        plot_bgcolor="rgba(10,10,20,0.95)",
+                        yaxis_title="IV (%)",
+                        legend=dict(orientation="h"),
+                        margin=dict(l=0, r=0, t=10, b=0))
+                    st.plotly_chart(fig_iv, use_container_width=True)
+                    st.caption("🟥 EXPANDING  🟩 COMPRESSING  ⬜ FLAT")
+
+                with chart_tabs[1]:
+                    fig_gfl = go.Figure()
+                    fig_gfl.add_trace(go.Scatter(
+                        x=df_deriv["timestamp"], y=df_deriv["spot_price"],
+                        name="Spot", line=dict(color="#00d4ff", width=2.5)))
+                    if df_deriv["gex_flip_level"].notna().any():
+                        fig_gfl.add_trace(go.Scatter(
+                            x=df_deriv["timestamp"],
+                            y=df_deriv["gex_flip_level"],
+                            name="GEX Flip Level",
+                            line=dict(color="#f59e0b", width=1.5, dash="dot")))
+                    fig_gfl.add_trace(go.Scatter(
+                        x=df_deriv["timestamp"], y=df_deriv["net_gex_total"],
+                        name="Net GEX Total", yaxis="y2",
+                        line=dict(color="#a78bfa", width=1.5),
+                        opacity=0.7))
+                    fig_gfl.update_layout(
+                        template="plotly_dark", height=380,
+                        paper_bgcolor="rgba(0,0,0,0)",
+                        plot_bgcolor="rgba(10,10,20,0.95)",
+                        yaxis=dict(title="Price"),
+                        yaxis2=dict(title="Net GEX (B)", overlaying="y",
+                                    side="right", showgrid=False),
+                        legend=dict(orientation="h"),
+                        margin=dict(l=0, r=0, t=10, b=0))
+                    st.plotly_chart(fig_gfl, use_container_width=True)
+
+                with chart_tabs[2]:
+                    fig_vz = go.Figure()
+                    fig_vz.add_trace(go.Scatter(
+                        x=df_deriv["timestamp"], y=df_deriv["spot_price"],
+                        name="Spot", line=dict(color="#00d4ff", width=2.5)))
+                    zone_cfg = {
+                        "vacuum_zone_level":    ("Vacuum Zone (LOC)",   "#10b981"),
+                        "trap_door_level":      ("Trap Door",           "#f59e0b"),
+                        "support_floor_level":  ("Support Floor",       "#06b6d4"),
+                        "resistance_ceil_level":("Resistance Ceiling",  "#ef4444"),
+                    }
+                    for col, (label, color) in zone_cfg.items():
+                        if df_deriv[col].notna().any():
+                            fig_vz.add_trace(go.Scatter(
+                                x=df_deriv["timestamp"],
+                                y=df_deriv[col],
+                                name=label,
+                                line=dict(color=color, width=1.5, dash="dash"),
+                                mode="lines+markers",
+                                marker=dict(size=5)))
+                    fig_vz.update_layout(
+                        template="plotly_dark", height=420,
+                        paper_bgcolor="rgba(0,0,0,0)",
+                        plot_bgcolor="rgba(10,10,20,0.95)",
+                        yaxis_title="Strike Level",
+                        legend=dict(orientation="h"),
+                        margin=dict(l=0, r=0, t=10, b=0))
+                    st.plotly_chart(fig_vz, use_container_width=True)
+
+                with chart_tabs[3]:
+                    fig_pcr = go.Figure()
+                    fig_pcr.add_trace(go.Scatter(
+                        x=df_deriv["timestamp"], y=df_deriv["pcr_oi"],
+                        name="PCR (OI)", line=dict(color="#ec4899", width=2)))
+                    fig_pcr.add_trace(go.Scatter(
+                        x=df_deriv["timestamp"], y=df_deriv["pcr_volume"],
+                        name="PCR (Volume)",
+                        line=dict(color="#f59e0b", width=1.5, dash="dash")))
+                    fig_pcr.add_hline(y=1.0, line_dash="dot",
+                                      line_color="#94a3b8",
+                                      annotation_text="PCR = 1.0 (neutral)")
+                    if df_deriv["max_pain"].notna().any():
+                        fig_pcr.add_trace(go.Scatter(
+                            x=df_deriv["timestamp"], y=df_deriv["max_pain"],
+                            name="Max Pain", yaxis="y2",
+                            line=dict(color="#00d4ff", width=1.5, dash="dot")))
+                    fig_pcr.update_layout(
+                        template="plotly_dark", height=350,
+                        paper_bgcolor="rgba(0,0,0,0)",
+                        plot_bgcolor="rgba(10,10,20,0.95)",
+                        yaxis=dict(title="PCR"),
+                        yaxis2=dict(title="Max Pain Strike", overlaying="y",
+                                    side="right", showgrid=False),
+                        legend=dict(orientation="h"),
+                        margin=dict(l=0, r=0, t=10, b=0))
+                    st.plotly_chart(fig_pcr, use_container_width=True)
+
+                with chart_tabs[4]:
+                    clrs = df_deriv["cascade_direction"].map(
+                        {"BEAR": "#ef4444", "BULL": "#10b981", "NONE": "#94a3b8"})
+                    fig_cas = go.Figure()
+                    fig_cas.add_trace(go.Bar(
+                        x=df_deriv["timestamp"],
+                        y=df_deriv["bear_fuel_pts"],
+                        name="Bear Fuel", marker_color="#ef4444", opacity=0.8))
+                    fig_cas.add_trace(go.Bar(
+                        x=df_deriv["timestamp"],
+                        y=df_deriv["bull_fuel_pts"],
+                        name="Bull Fuel", marker_color="#10b981", opacity=0.8))
+                    fig_cas.add_trace(go.Scatter(
+                        x=df_deriv["timestamp"],
+                        y=df_deriv["bear_quality"],
+                        name="Bear Quality", yaxis="y2",
+                        line=dict(color="#fbbf24", width=2)))
+                    fig_cas.add_trace(go.Scatter(
+                        x=df_deriv["timestamp"],
+                        y=df_deriv["bull_quality"],
+                        name="Bull Quality", yaxis="y2",
+                        line=dict(color="#00f5c4", width=2)))
+                    fig_cas.add_hline(y=0, line_color="#475569", line_width=1)
+                    fig_cas.update_layout(
+                        template="plotly_dark", height=380, barmode="group",
+                        paper_bgcolor="rgba(0,0,0,0)",
+                        plot_bgcolor="rgba(10,10,20,0.95)",
+                        yaxis=dict(title="Cascade Pts"),
+                        yaxis2=dict(title="Quality Ratio", overlaying="y",
+                                    side="right", showgrid=False),
+                        legend=dict(orientation="h"),
+                        margin=dict(l=0, r=0, t=10, b=0))
+                    st.plotly_chart(fig_cas, use_container_width=True)
+
+                with chart_tabs[5]:
+                    fig_ch = go.Figure()
+                    fig_ch.add_trace(go.Scatter(
+                        x=df_deriv["timestamp"],
+                        y=df_deriv["net_charm_total"],
+                        name="Net Charm",
+                        fill="tozeroy",
+                        fillcolor="rgba(168,85,247,0.12)",
+                        line=dict(color="#a78bfa", width=2)))
+                    fig_ch.add_hline(y=0, line_dash="dot",
+                                     line_color="#94a3b8")
+                    fig_ch.update_layout(
+                        template="plotly_dark", height=320,
+                        paper_bgcolor="rgba(0,0,0,0)",
+                        plot_bgcolor="rgba(10,10,20,0.95)",
+                        yaxis_title="Net Charm (B/day)",
+                        margin=dict(l=0, r=0, t=10, b=0))
+                    st.plotly_chart(fig_ch, use_container_width=True)
+                    st.caption(
+                        "Net Charm = total dealer delta-decay per day. "
+                        "Large positive → expiry pin above spot. "
+                        "Large negative → pin below spot.")
+
+                # ── Export derived ────────────────────────────────────────────
+                st.markdown("---")
+                csv_d = df_deriv.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    f"⬇️ Download Derivatives CSV — {prev_date}",
+                    data=csv_d,
+                    file_name=f"hedgex_derived_{symbol}_{prev_date}.csv",
+                    mime="text/csv",
+                    use_container_width=True)
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # TAB 4 — Export
     # ═════════════════════════════════════════════════════════════════════════
     with tab_export:
         st.markdown("### 📥 Export Raw Data")
@@ -916,7 +1678,7 @@ def main():
                              use_container_width=True, hide_index=True)
 
     # ═════════════════════════════════════════════════════════════════════════
-    # TAB 4 — API Inspector
+    # TAB 5 — API Inspector
     # ═════════════════════════════════════════════════════════════════════════
     with tab_inspect:
         st.markdown("### 🔬 API Response Inspector")
