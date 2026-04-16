@@ -33,7 +33,10 @@ CKPT_PATH = "hedgex_collector_ckpt.json"
 # ── MASTER CONFIG — update token here when it expires ─────────────────────────
 DHAN_CLIENT_ID    = "1100480354"
 DHAN_ACCESS_TOKEN = (
-   "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzc2MzY2NTEzLCJhcHBfaWQiOiJhYjYxZmJmOSIsImlhdCI6MTc3NjI4MDExMywidG9rZW5Db25zdW1lclR5cGUiOiJBUFAiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwMDQ4MDM1NCJ9.tWhBYSbeNT25V9OJcK3mdV1OHorASWlX_GH-iwNSfmKcY-6PB6hJDHenzZC6-mvrLcOZ3LgVUp8oAtQopwcovQ"
+    "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9"
+    ".eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzc1NjMyMDMyLCJhcHBfaWQiOiJhYjYxZmJmOSIs"
+    "ImlhdCI6MTc3NTU0NTYzMiwidG9rZW5Db25zdW1lclR5cGUiOiJBUFAiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwMDQ4MDM1NCJ9"
+    ".6mLI3OTxCjgy4oEvqtjKG1BUgP3OLWuenA011y-FXfXQZbpnmZ_aeBjWMu5c-DKzhPUfLQZPVtUr2eQ7_-lmDQ"
 )
 
 DHAN_INDEX_SECURITY_IDS = {
@@ -237,6 +240,39 @@ def init_db():
             estimated_cascade_pts REAL,
             -- Charm
             net_charm_total       REAL,
+            -- VANNA zone detail + probability scores (up to 3 per role)
+            vacuum_zone_1_strike    REAL, vacuum_zone_1_magnitude REAL, vacuum_zone_1_dist_pct REAL,
+            vacuum_zone_1_bull      INTEGER, vacuum_zone_1_bear INTEGER, vacuum_zone_1_score INTEGER, vacuum_zone_1_dir TEXT,
+            vacuum_zone_2_strike    REAL, vacuum_zone_2_magnitude REAL, vacuum_zone_2_dist_pct REAL,
+            vacuum_zone_2_bull      INTEGER, vacuum_zone_2_bear INTEGER, vacuum_zone_2_score INTEGER, vacuum_zone_2_dir TEXT,
+            vacuum_zone_3_strike    REAL, vacuum_zone_3_magnitude REAL, vacuum_zone_3_dist_pct REAL,
+            vacuum_zone_3_bull      INTEGER, vacuum_zone_3_bear INTEGER, vacuum_zone_3_score INTEGER, vacuum_zone_3_dir TEXT,
+            trap_door_1_strike      REAL, trap_door_1_magnitude REAL, trap_door_1_dist_pct REAL,
+            trap_door_1_bull        INTEGER, trap_door_1_bear INTEGER, trap_door_1_score INTEGER, trap_door_1_dir TEXT,
+            trap_door_2_strike      REAL, trap_door_2_magnitude REAL, trap_door_2_dist_pct REAL,
+            trap_door_2_bull        INTEGER, trap_door_2_bear INTEGER, trap_door_2_score INTEGER, trap_door_2_dir TEXT,
+            trap_door_3_strike      REAL, trap_door_3_magnitude REAL, trap_door_3_dist_pct REAL,
+            trap_door_3_bull        INTEGER, trap_door_3_bear INTEGER, trap_door_3_score INTEGER, trap_door_3_dir TEXT,
+            support_floor_1_strike  REAL, support_floor_1_magnitude REAL, support_floor_1_dist_pct REAL,
+            support_floor_1_bull    INTEGER, support_floor_1_bear INTEGER, support_floor_1_score INTEGER, support_floor_1_dir TEXT,
+            support_floor_2_strike  REAL, support_floor_2_magnitude REAL, support_floor_2_dist_pct REAL,
+            support_floor_2_bull    INTEGER, support_floor_2_bear INTEGER, support_floor_2_score INTEGER, support_floor_2_dir TEXT,
+            support_floor_3_strike  REAL, support_floor_3_magnitude REAL, support_floor_3_dist_pct REAL,
+            support_floor_3_bull    INTEGER, support_floor_3_bear INTEGER, support_floor_3_score INTEGER, support_floor_3_dir TEXT,
+            resistance_ceil_1_strike REAL, resistance_ceil_1_magnitude REAL, resistance_ceil_1_dist_pct REAL,
+            resistance_ceil_1_bull  INTEGER, resistance_ceil_1_bear INTEGER, resistance_ceil_1_score INTEGER, resistance_ceil_1_dir TEXT,
+            resistance_ceil_2_strike REAL, resistance_ceil_2_magnitude REAL, resistance_ceil_2_dist_pct REAL,
+            resistance_ceil_2_bull  INTEGER, resistance_ceil_2_bear INTEGER, resistance_ceil_2_score INTEGER, resistance_ceil_2_dir TEXT,
+            resistance_ceil_3_strike REAL, resistance_ceil_3_magnitude REAL, resistance_ceil_3_dist_pct REAL,
+            resistance_ceil_3_bull  INTEGER, resistance_ceil_3_bear INTEGER, resistance_ceil_3_score INTEGER, resistance_ceil_3_dir TEXT,
+            -- Weighted aggregate probability
+            prob_bull               REAL,
+            prob_bear               REAL,
+            prob_direction          TEXT,
+            prob_confidence         REAL,
+            prob_n_zones            INTEGER,
+            prob_n_bull_zones       INTEGER,
+            prob_n_bear_zones       INTEGER,
             UNIQUE(symbol, trade_date, timestamp, expiry_code, expiry_flag, interval_min)
         )""")
     con.execute("""
@@ -605,6 +641,228 @@ def _vanna_flip_zones(df_ts, spot):
     return zones
 
 
+def _zone_probability(zones, iv_regime, spot, avg_iv):
+    """
+    Compute bull/bear probability score for each VANNA flip zone.
+
+    Scoring matrix (from HedGEX research):
+    ┌──────────────────────┬────────────┬──────┬──────┬──────────────────────┐
+    │ Role                 │ IV Regime  │ Bull │ Bear │ Rationale            │
+    ├──────────────────────┼────────────┼──────┼──────┼──────────────────────┤
+    │ VACUUM_ZONE          │ EXPANDING  │  90  │  10  │ LOC break — squeeze  │
+    │ VACUUM_ZONE          │ FLAT       │  60  │  40  │ mild magnet          │
+    │ VACUUM_ZONE          │ COMPRESSING│  35  │  65  │ ceiling holds        │
+    │ TRAP_DOOR            │ EXPANDING  │   5  │  95  │ strongest bear signal│
+    │ TRAP_DOOR            │ FLAT       │  25  │  75  │ trap moderately armed│
+    │ TRAP_DOOR            │ COMPRESSING│  55  │  45  │ trap weakened        │
+    │ SUPPORT_FLOOR        │ COMPRESSING│  85  │  15  │ floor holds          │
+    │ SUPPORT_FLOOR        │ FLAT       │  60  │  40  │ moderate support     │
+    │ SUPPORT_FLOOR        │ EXPANDING  │  15  │  85  │ floor breaks!        │
+    │ RESISTANCE_CEILING   │ EXPANDING  │  20  │  80  │ ceiling pressed      │
+    │ RESISTANCE_CEILING   │ FLAT       │  40  │  60  │ mild resistance      │
+    │ RESISTANCE_CEILING   │ COMPRESSING│  65  │  35  │ ceiling fades        │
+    └──────────────────────┴────────────┴──────┴──────┴──────────────────────┘
+
+    Final score adjustment:
+      distance_pct < 0.5%  → × 1.20  (very close to spot — high activation risk)
+      distance_pct < 1.0%  → × 1.10
+      distance_pct > 3.0%  → × 0.85  (far from spot — lower immediacy)
+      magnitude_norm > 0.7 → bull/bear bias amplified by 5 pts (strong zone)
+      avg_iv > 20%         → expanding scores amplified by 5 pts (elevated IV env)
+
+    Returns list of dicts — one per zone — with bull_score, bear_score, final_score.
+    """
+    SCORE_MATRIX = {
+        ("VACUUM_ZONE",        "EXPANDING"):   (90, 10),
+        ("VACUUM_ZONE",        "FLAT"):        (60, 40),
+        ("VACUUM_ZONE",        "COMPRESSING"): (35, 65),
+        ("TRAP_DOOR",          "EXPANDING"):   ( 5, 95),
+        ("TRAP_DOOR",          "FLAT"):        (25, 75),
+        ("TRAP_DOOR",          "COMPRESSING"): (55, 45),
+        ("SUPPORT_FLOOR",      "COMPRESSING"): (85, 15),
+        ("SUPPORT_FLOOR",      "FLAT"):        (60, 40),
+        ("SUPPORT_FLOOR",      "EXPANDING"):   (15, 85),
+        ("RESISTANCE_CEILING", "EXPANDING"):   (20, 80),
+        ("RESISTANCE_CEILING", "FLAT"):        (40, 60),
+        ("RESISTANCE_CEILING", "COMPRESSING"): (65, 35),
+    }
+
+    if not zones:
+        return []
+
+    max_mag = max((z.get("magnitude", 0) for z in zones), default=1.0)
+    if max_mag <= 0:
+        max_mag = 1.0
+
+    results = []
+    for z in zones:
+        role     = z["role"]
+        zk       = z["strike"]
+        mag      = z.get("magnitude", 0.0)
+        dist_pct = abs(zk - spot) / spot * 100 if spot > 0 else 0.0
+        mag_norm = mag / max_mag   # 0→1 relative to strongest zone
+
+        bull_base, bear_base = SCORE_MATRIX.get((role, iv_regime), (50, 50))
+
+        # Distance adjustment
+        if   dist_pct < 0.5: dist_factor = 1.20
+        elif dist_pct < 1.0: dist_factor = 1.10
+        elif dist_pct > 3.0: dist_factor = 0.85
+        else:                 dist_factor = 1.00
+
+        # Magnitude adjustment (strong zone amplifies dominant direction by 5 pts)
+        if mag_norm > 0.70:
+            if bull_base >= bear_base: bull_base = min(100, bull_base + 5)
+            else:                      bear_base = min(100, bear_base + 5)
+
+        # IV level adjustment (high IV env amplifies expanding-regime scores)
+        if avg_iv > 20 and iv_regime == "EXPANDING":
+            if bull_base >= bear_base: bull_base = min(100, bull_base + 5)
+            else:                      bear_base = min(100, bear_base + 5)
+
+        # Apply distance factor to dominant direction
+        if bull_base >= bear_base:
+            bull_score = min(100, round(bull_base * dist_factor))
+            bear_score = max(0, 100 - bull_score)
+        else:
+            bear_score = min(100, round(bear_base * dist_factor))
+            bull_score = max(0, 100 - bear_score)
+
+        # Final composite score — confidence in the dominant direction
+        final_score = max(bull_score, bear_score)
+        direction   = "BULLISH" if bull_score > bear_score else "BEARISH"
+        if abs(bull_score - bear_score) <= 15:
+            direction = "CONFLICTED"
+
+        results.append({
+            "strike":       zk,
+            "role":         role,
+            "magnitude":    round(mag, 6),
+            "mag_norm":     round(mag_norm, 4),
+            "distance_pct": round(dist_pct, 3),
+            "bull_score":   bull_score,
+            "bear_score":   bear_score,
+            "final_score":  final_score,
+            "direction":    direction,
+            "iv_regime":    iv_regime,
+        })
+
+    # Sort by final_score descending (strongest signal first)
+    return sorted(results, key=lambda x: -x["final_score"])
+
+
+def _weighted_avg_probability(zone_scores):
+    """
+    Aggregate all zone probability scores into a single bull/bear reading.
+    Weight = final_score — higher confidence zones contribute more.
+    Returns dict with avg_bull, avg_bear, net_direction, weighted_confidence.
+    """
+    if not zone_scores:
+        return {
+            "prob_bull": 50.0, "prob_bear": 50.0,
+            "prob_direction": "NEUTRAL", "prob_confidence": 0.0,
+            "prob_n_zones": 0, "prob_n_bull_zones": 0, "prob_n_bear_zones": 0,
+        }
+
+    total_wt = sum(z["final_score"] for z in zone_scores) or 1.0
+    avg_bull = sum(z["bull_score"] * z["final_score"] for z in zone_scores) / total_wt
+    avg_bear = sum(z["bear_score"] * z["final_score"] for z in zone_scores) / total_wt
+    diff     = avg_bull - avg_bear
+
+    if   diff >  15: direction = "BULLISH"
+    elif diff < -15: direction = "BEARISH"
+    elif max(avg_bull, avg_bear) >= 60: direction = "CONFLICTED"
+    else:            direction = "NEUTRAL"
+
+    n_bull = sum(1 for z in zone_scores if z["direction"] == "BULLISH")
+    n_bear = sum(1 for z in zone_scores if z["direction"] == "BEARISH")
+    conf   = abs(diff)  # 0–100, higher = more decisive
+
+    return {
+        "prob_bull":          round(avg_bull, 2),
+        "prob_bear":          round(avg_bear, 2),
+        "prob_direction":     direction,
+        "prob_confidence":    round(conf, 2),
+        "prob_n_zones":       len(zone_scores),
+        "prob_n_bull_zones":  n_bull,
+        "prob_n_bear_zones":  n_bear,
+    }
+
+
+def _zone_to_flat_cols(zones, prefix):
+    """
+    Flatten the top-3 zones of a given role into individual columns.
+    e.g. vacuum_zone_1_strike, vacuum_zone_1_bull, vacuum_zone_1_bear …
+    """
+    out = {}
+    for i, z in enumerate(zones[:3], 1):
+        p = f"{prefix}_{i}"
+        out[f"{p}_strike"]    = z.get("strike")
+        out[f"{p}_magnitude"] = z.get("magnitude")
+        out[f"{p}_dist_pct"]  = z.get("distance_pct")
+        out[f"{p}_bull"]      = z.get("bull_score")
+        out[f"{p}_bear"]      = z.get("bear_score")
+        out[f"{p}_score"]     = z.get("final_score")
+        out[f"{p}_dir"]       = z.get("direction")
+    # Fill missing slots with None
+    for i in range(len(zones) + 1, 4):
+        p = f"{prefix}_{i}"
+        for sfx in ("_strike","_magnitude","_dist_pct","_bull","_bear","_score","_dir"):
+            out[f"{p}{sfx}"] = None
+    return out
+
+
+def _all_zone_cols():
+    """Return ordered list of all zone + probability column names."""
+    cols = []
+    for prefix in ("vacuum_zone","trap_door","support_floor","resistance_ceil"):
+        for i in range(1, 4):
+            p = f"{prefix}_{i}"
+            for sfx in ("_strike","_magnitude","_dist_pct","_bull","_bear","_score","_dir"):
+                cols.append(f"{p}{sfx}")
+    for k in ("prob_bull","prob_bear","prob_direction","prob_confidence",
+              "prob_n_zones","prob_n_bull_zones","prob_n_bear_zones"):
+        cols.append(k)
+    return cols
+
+
+def _empty_zone_cols():
+    return {c: None for c in _all_zone_cols()}
+
+
+def _zone_col_defs():
+    """Human descriptions for every zone + probability column."""
+    defs = {}
+    role_label = {
+        "vacuum_zone":     "Vacuum Zone (LOC — NEG→POS above spot)",
+        "trap_door":       "Trap Door (POS→NEG below spot)",
+        "support_floor":   "Support Floor (NEG→POS below spot)",
+        "resistance_ceil": "Resistance Ceiling (POS→NEG above spot)",
+    }
+    sfx_label = {
+        "_strike":    "Interpolated flip level (strike price)",
+        "_magnitude": "Zone strength = avg |net_vanna| at bounding strikes (B)",
+        "_dist_pct":  "Distance from spot as % of spot",
+        "_bull":      "Bull probability score 0–100 (IV regime × zone role)",
+        "_bear":      "Bear probability score 0–100 (IV regime × zone role)",
+        "_score":     "Final confidence score = max(bull, bear) adjusted for distance + magnitude",
+        "_dir":       "BULLISH / BEARISH / CONFLICTED",
+    }
+    for prefix, rlabel in role_label.items():
+        for i in range(1, 4):
+            p = f"{prefix}_{i}"
+            for sfx, slabel in sfx_label.items():
+                defs[f"{p}{sfx}"] = f"{rlabel} — Zone #{i} — {slabel}"
+    defs["prob_bull"]         = "Weighted avg bull score across ALL zones (weight = final_score)"
+    defs["prob_bear"]         = "Weighted avg bear score across ALL zones (weight = final_score)"
+    defs["prob_direction"]    = "BULLISH / BEARISH / CONFLICTED / NEUTRAL — aggregate from all zones"
+    defs["prob_confidence"]   = "|avg_bull − avg_bear| — 0=no signal, 100=max conviction"
+    defs["prob_n_zones"]      = "Total number of VANNA flip zones detected at this bar"
+    defs["prob_n_bull_zones"] = "Number of zones individually voting BULLISH"
+    defs["prob_n_bear_zones"] = "Number of zones individually voting BEARISH"
+    return defs
+
+
 def _gex_flip_level(df_ts, spot):
     """Linear interpolation of the gamma flip level (net_gex = 0 crossing)."""
     df_s = df_ts.sort_values("strike").reset_index(drop=True)
@@ -805,11 +1063,30 @@ def compute_derivatives_for_day(df_day, symbol, trade_date,
         vanna_below     = float(df_ts[df_ts["strike"] < spot]["net_vanna"].sum())
         vanna_skew      = round(vanna_above / max(abs(vanna_below), 1e-9), 4)
 
-        vz = _vanna_flip_zones(df_ts, spot)
-        vacuum_zone_lvl   = next((z["strike"] for z in vz if z["role"] == "VACUUM_ZONE"),      None)
-        trap_door_lvl     = next((z["strike"] for z in vz if z["role"] == "TRAP_DOOR"),         None)
-        support_floor_lvl = next((z["strike"] for z in vz if z["role"] == "SUPPORT_FLOOR"),     None)
-        resistance_lvl    = next((z["strike"] for z in vz if z["role"] == "RESISTANCE_CEILING"),None)
+        vz        = _vanna_flip_zones(df_ts, spot)
+        vz_scored = _zone_probability(vz, iv_regime, spot, avg_iv)
+
+        # Convenience: first zone level of each role (for backward compat columns)
+        vacuum_zone_lvl   = next((z["strike"] for z in vz if z["role"] == "VACUUM_ZONE"),       None)
+        trap_door_lvl     = next((z["strike"] for z in vz if z["role"] == "TRAP_DOOR"),          None)
+        support_floor_lvl = next((z["strike"] for z in vz if z["role"] == "SUPPORT_FLOOR"),      None)
+        resistance_lvl    = next((z["strike"] for z in vz if z["role"] == "RESISTANCE_CEILING"), None)
+
+        # Per-role scored zones (up to 3 each, sorted by final_score)
+        vac_zones  = [z for z in vz_scored if z["role"] == "VACUUM_ZONE"]
+        trap_zones = [z for z in vz_scored if z["role"] == "TRAP_DOOR"]
+        supp_zones = [z for z in vz_scored if z["role"] == "SUPPORT_FLOOR"]
+        res_zones  = [z for z in vz_scored if z["role"] == "RESISTANCE_CEILING"]
+
+        zone_flat_cols = {
+            **_zone_to_flat_cols(vac_zones,  "vacuum_zone"),
+            **_zone_to_flat_cols(trap_zones, "trap_door"),
+            **_zone_to_flat_cols(supp_zones, "support_floor"),
+            **_zone_to_flat_cols(res_zones,  "resistance_ceil"),
+        }
+
+        # Weighted aggregate probability across all zones
+        prob = _weighted_avg_probability(vz_scored)
 
         # ── Enhanced OI VANNA (flow) ──────────────────────────────────────────
         eov_vals         = _enhanced_oi_vanna(df_ts, spot, contract_size, scaling, tte)
@@ -875,6 +1152,9 @@ def compute_derivatives_for_day(df_day, symbol, trade_date,
             **cas,
             # Charm
             "net_charm_total":       round(net_charm, 6),
+            # VANNA zone detail (up to 3 per role) + probability scores
+            **zone_flat_cols,
+            **prob,
         })
 
     return results
@@ -897,7 +1177,98 @@ def save_derived(rows: List[Dict]):
             net_flow_vanna_total,
             bear_fuel_pts, bear_absorb_pts, bull_fuel_pts, bull_absorb_pts,
             bear_quality, bull_quality, cascade_direction, estimated_cascade_pts,
-            net_charm_total
+            net_charm_total,
+            vacuum_zone_1_strike,
+            vacuum_zone_1_magnitude,
+            vacuum_zone_1_dist_pct,
+            vacuum_zone_1_bull,
+            vacuum_zone_1_bear,
+            vacuum_zone_1_score,
+            vacuum_zone_1_dir,
+            vacuum_zone_2_strike,
+            vacuum_zone_2_magnitude,
+            vacuum_zone_2_dist_pct,
+            vacuum_zone_2_bull,
+            vacuum_zone_2_bear,
+            vacuum_zone_2_score,
+            vacuum_zone_2_dir,
+            vacuum_zone_3_strike,
+            vacuum_zone_3_magnitude,
+            vacuum_zone_3_dist_pct,
+            vacuum_zone_3_bull,
+            vacuum_zone_3_bear,
+            vacuum_zone_3_score,
+            vacuum_zone_3_dir,
+            trap_door_1_strike,
+            trap_door_1_magnitude,
+            trap_door_1_dist_pct,
+            trap_door_1_bull,
+            trap_door_1_bear,
+            trap_door_1_score,
+            trap_door_1_dir,
+            trap_door_2_strike,
+            trap_door_2_magnitude,
+            trap_door_2_dist_pct,
+            trap_door_2_bull,
+            trap_door_2_bear,
+            trap_door_2_score,
+            trap_door_2_dir,
+            trap_door_3_strike,
+            trap_door_3_magnitude,
+            trap_door_3_dist_pct,
+            trap_door_3_bull,
+            trap_door_3_bear,
+            trap_door_3_score,
+            trap_door_3_dir,
+            support_floor_1_strike,
+            support_floor_1_magnitude,
+            support_floor_1_dist_pct,
+            support_floor_1_bull,
+            support_floor_1_bear,
+            support_floor_1_score,
+            support_floor_1_dir,
+            support_floor_2_strike,
+            support_floor_2_magnitude,
+            support_floor_2_dist_pct,
+            support_floor_2_bull,
+            support_floor_2_bear,
+            support_floor_2_score,
+            support_floor_2_dir,
+            support_floor_3_strike,
+            support_floor_3_magnitude,
+            support_floor_3_dist_pct,
+            support_floor_3_bull,
+            support_floor_3_bear,
+            support_floor_3_score,
+            support_floor_3_dir,
+            resistance_ceil_1_strike,
+            resistance_ceil_1_magnitude,
+            resistance_ceil_1_dist_pct,
+            resistance_ceil_1_bull,
+            resistance_ceil_1_bear,
+            resistance_ceil_1_score,
+            resistance_ceil_1_dir,
+            resistance_ceil_2_strike,
+            resistance_ceil_2_magnitude,
+            resistance_ceil_2_dist_pct,
+            resistance_ceil_2_bull,
+            resistance_ceil_2_bear,
+            resistance_ceil_2_score,
+            resistance_ceil_2_dir,
+            resistance_ceil_3_strike,
+            resistance_ceil_3_magnitude,
+            resistance_ceil_3_dist_pct,
+            resistance_ceil_3_bull,
+            resistance_ceil_3_bear,
+            resistance_ceil_3_score,
+            resistance_ceil_3_dir,
+            prob_bull,
+            prob_bear,
+            prob_direction,
+            prob_confidence,
+            prob_n_zones,
+            prob_n_bull_zones,
+            prob_n_bear_zones
         ) VALUES (
             :symbol, :trade_date, :timestamp, :expiry_code, :expiry_flag, :interval_min,
             :spot_price,
@@ -911,7 +1282,98 @@ def save_derived(rows: List[Dict]):
             :net_flow_vanna_total,
             :bear_fuel_pts, :bear_absorb_pts, :bull_fuel_pts, :bull_absorb_pts,
             :bear_quality, :bull_quality, :cascade_direction, :estimated_cascade_pts,
-            :net_charm_total
+            :net_charm_total,
+            :vacuum_zone_1_strike,
+            :vacuum_zone_1_magnitude,
+            :vacuum_zone_1_dist_pct,
+            :vacuum_zone_1_bull,
+            :vacuum_zone_1_bear,
+            :vacuum_zone_1_score,
+            :vacuum_zone_1_dir,
+            :vacuum_zone_2_strike,
+            :vacuum_zone_2_magnitude,
+            :vacuum_zone_2_dist_pct,
+            :vacuum_zone_2_bull,
+            :vacuum_zone_2_bear,
+            :vacuum_zone_2_score,
+            :vacuum_zone_2_dir,
+            :vacuum_zone_3_strike,
+            :vacuum_zone_3_magnitude,
+            :vacuum_zone_3_dist_pct,
+            :vacuum_zone_3_bull,
+            :vacuum_zone_3_bear,
+            :vacuum_zone_3_score,
+            :vacuum_zone_3_dir,
+            :trap_door_1_strike,
+            :trap_door_1_magnitude,
+            :trap_door_1_dist_pct,
+            :trap_door_1_bull,
+            :trap_door_1_bear,
+            :trap_door_1_score,
+            :trap_door_1_dir,
+            :trap_door_2_strike,
+            :trap_door_2_magnitude,
+            :trap_door_2_dist_pct,
+            :trap_door_2_bull,
+            :trap_door_2_bear,
+            :trap_door_2_score,
+            :trap_door_2_dir,
+            :trap_door_3_strike,
+            :trap_door_3_magnitude,
+            :trap_door_3_dist_pct,
+            :trap_door_3_bull,
+            :trap_door_3_bear,
+            :trap_door_3_score,
+            :trap_door_3_dir,
+            :support_floor_1_strike,
+            :support_floor_1_magnitude,
+            :support_floor_1_dist_pct,
+            :support_floor_1_bull,
+            :support_floor_1_bear,
+            :support_floor_1_score,
+            :support_floor_1_dir,
+            :support_floor_2_strike,
+            :support_floor_2_magnitude,
+            :support_floor_2_dist_pct,
+            :support_floor_2_bull,
+            :support_floor_2_bear,
+            :support_floor_2_score,
+            :support_floor_2_dir,
+            :support_floor_3_strike,
+            :support_floor_3_magnitude,
+            :support_floor_3_dist_pct,
+            :support_floor_3_bull,
+            :support_floor_3_bear,
+            :support_floor_3_score,
+            :support_floor_3_dir,
+            :resistance_ceil_1_strike,
+            :resistance_ceil_1_magnitude,
+            :resistance_ceil_1_dist_pct,
+            :resistance_ceil_1_bull,
+            :resistance_ceil_1_bear,
+            :resistance_ceil_1_score,
+            :resistance_ceil_1_dir,
+            :resistance_ceil_2_strike,
+            :resistance_ceil_2_magnitude,
+            :resistance_ceil_2_dist_pct,
+            :resistance_ceil_2_bull,
+            :resistance_ceil_2_bear,
+            :resistance_ceil_2_score,
+            :resistance_ceil_2_dir,
+            :resistance_ceil_3_strike,
+            :resistance_ceil_3_magnitude,
+            :resistance_ceil_3_dist_pct,
+            :resistance_ceil_3_bull,
+            :resistance_ceil_3_bear,
+            :resistance_ceil_3_score,
+            :resistance_ceil_3_dir,
+            :prob_bull,
+            :prob_bear,
+            :prob_direction,
+            :prob_confidence,
+            :prob_n_zones,
+            :prob_n_bull_zones,
+            :prob_n_bear_zones
         )""", rows)
     con.commit()
     con.close()
@@ -1609,84 +2071,440 @@ def main():
     # TAB 4 — Export
     # ═════════════════════════════════════════════════════════════════════════
     with tab_export:
-        st.markdown("### 📥 Export Raw Data")
+        st.markdown("### 📥 Export Data")
 
-        st.markdown("""
-        <div class="info-box">
-        Export raw data to CSV for offline analysis, strategy backtesting,
-        or feeding into the overnight strategy engine.
-        </div>""", unsafe_allow_html=True)
+        # ── Column definitions ────────────────────────────────────────────────
+        RAW_COLS = {
+            # identity
+            "symbol":            "Symbol name",
+            "trade_date":        "Trading date",
+            "timestamp":         "Bar timestamp (IST)",
+            "expiry_code":       "Expiry code (1/2/3)",
+            "expiry_flag":       "WEEK or MONTH",
+            "interval_min":      "Bar interval (5/15/60 min)",
+            "strike_type":       "ATM / ATM+1 / ATM-1 …",
+            "strike":            "Strike price",
+            "spot_price":        "Underlying spot price",
+            # OI
+            "call_oi":           "Call open interest (contracts)",
+            "put_oi":            "Put open interest (contracts)",
+            "call_oi_chg":       "Call OI bar-over-bar change",
+            "put_oi_chg":        "Put OI bar-over-bar change",
+            # volume
+            "call_vol":          "Call traded volume",
+            "put_vol":           "Put traded volume",
+            # IV
+            "call_iv":           "Call implied volatility (%)",
+            "put_iv":            "Put implied volatility (%)",
+            # LTP
+            "call_ltp":          "Call last traded price (₹)",
+            "put_ltp":           "Put last traded price (₹)",
+            # GEX
+            "call_gex":          "Call GEX = call_oi × gamma × S² × lot / 1e9 (B)",
+            "put_gex":           "Put GEX = -put_oi × gamma × S² × lot / 1e9 (B)",
+            "net_gex":           "Net GEX = call_gex + put_gex (B)",
+            # VANNA
+            "call_vanna":        "Call VANNA = call_oi × vanna × S × lot / 1e9 (B)",
+            "put_vanna":         "Put VANNA = put_oi × vanna × S × lot / 1e9 (B)",
+            "net_vanna":         "Net VANNA = call_vanna + put_vanna (B)",
+            # raw greeks
+            "call_gamma":        "Call gamma greek (∂²C/∂S²)",
+            "put_gamma":         "Put gamma greek (∂²P/∂S²)",
+            "call_vanna_greek":  "Call vanna greek (∂Δ/∂σ)",
+            "put_vanna_greek":   "Put vanna greek (∂Δ/∂σ)",
+        }
 
+        DERIVED_COLS = {
+            # identity (snapshot level — one row per bar, not per strike)
+            "symbol":                "Symbol name",
+            "trade_date":            "Trading date",
+            "timestamp":             "Bar timestamp (IST)",
+            "expiry_code":           "Expiry code (1/2/3)",
+            "expiry_flag":           "WEEK or MONTH",
+            "interval_min":          "Bar interval (5/15/60 min)",
+            "spot_price":            "Underlying spot price at this bar",
+            # IV metrics
+            "avg_iv":                "Mean IV across all strikes — (call_iv + put_iv) / 2",
+            "atm_iv":                "IV at the ATM strike specifically",
+            "iv_skew":               "put_iv_atm − call_iv_atm (put premium over call)",
+            "iv_change":             "Bar-over-bar change in avg_iv",
+            "iv_regime":             "EXPANDING / COMPRESSING / FLAT (from iv_change threshold)",
+            "iv_term_structure":     "OTM avg IV − ATM IV (vol surface slope)",
+            # OI metrics
+            "total_call_oi":         "Sum of call_oi across all strikes",
+            "total_put_oi":          "Sum of put_oi across all strikes",
+            "pcr_oi":                "Put/Call ratio by OI = total_put_oi / total_call_oi",
+            "pcr_volume":            "Put/Call ratio by volume = total_put_vol / total_call_vol",
+            "max_pain":              "Strike minimising total option OI dollar value at expiry",
+            "call_oi_concentration": "% of total call OI at the single largest call strike",
+            "put_oi_concentration":  "% of total put OI at the single largest put strike",
+            "oi_buildup_signal":     "LONG_BUILDUP / SHORT_BUILDUP / SHORT_COVERING / LONG_UNWINDING / NEUTRAL",
+            # GEX derivatives
+            "net_gex_total":         "Sum of net_gex across all strikes (total dealer gamma)",
+            "cumulative_gex_above":  "Sum of net_gex for strikes > spot (call wall strength)",
+            "cumulative_gex_below":  "Sum of net_gex for strikes < spot (put support strength)",
+            "gex_flip_level":        "Interpolated strike where net_gex crosses zero (gamma flip)",
+            "gex_skew":              "cumulative_gex_above / |cumulative_gex_below| (directional bias)",
+            "largest_gex_strike":    "Strike with highest |net_gex| — primary dealer anchor",
+            # VANNA derivatives
+            "net_vanna_total":       "Sum of net_vanna across all strikes",
+            "vacuum_zone_level":     "LOC: K_flip where net_vanna NEG→POS above spot",
+            "trap_door_level":       "K_flip where net_vanna POS→NEG below spot",
+            "support_floor_level":   "K_flip where net_vanna NEG→POS below spot (rare)",
+            "resistance_ceil_level": "K_flip where net_vanna POS→NEG above spot",
+            "vanna_skew":            "net_vanna_above_spot / |net_vanna_below_spot|",
+            # Flow VANNA
+            "net_flow_vanna_total":  "Sum of enhanced_oi_vanna: oi_chg × vanna × vol_wt × iv_adj × dist_wt × S × lot / scale",
+            # Cascade mathematics
+            "bear_fuel_pts":         "Sum of cascade pts from negative GEX strikes below spot",
+            "bear_absorb_pts":       "Sum of cascade pts from positive GEX strikes below spot",
+            "bull_fuel_pts":         "Sum of cascade pts from negative GEX strikes above spot",
+            "bull_absorb_pts":       "Sum of cascade pts from positive GEX strikes above spot",
+            "bear_quality":          "bear_fuel_pts / bear_absorb_pts (>1 = bear cascade likely)",
+            "bull_quality":          "bull_fuel_pts / bull_absorb_pts (>1 = bull cascade likely)",
+            "cascade_direction":     "BEAR / BULL / NONE — dominant cascade signal at this bar",
+            "estimated_cascade_pts": "Net cascade pts after fuel−absorption offset",
+            # Charm
+            "net_charm_total":       "Net dealer delta-decay per day (∂Δ/∂t) — expiry pin force (B/day)",
+            # VANNA zone detail — up to 3 zones per role
+            # Each zone has: _strike · _magnitude · _dist_pct · _bull · _bear · _score · _dir
+            "vacuum_zone_1_strike":    "Vacuum Zone #1 (LOC) — interpolated flip level",
+            "vacuum_zone_1_magnitude": "Vacuum Zone #1 — zone strength (avg |net_vanna| B)",
+            "vacuum_zone_1_dist_pct":  "Vacuum Zone #1 — distance from spot as % of spot",
+            "vacuum_zone_1_bull":      "Vacuum Zone #1 — bull probability 0–100",
+            "vacuum_zone_1_bear":      "Vacuum Zone #1 — bear probability 0–100",
+            "vacuum_zone_1_score":     "Vacuum Zone #1 — final confidence score",
+            "vacuum_zone_1_dir":       "Vacuum Zone #1 — BULLISH / BEARISH / CONFLICTED",
+            "vacuum_zone_2_strike":    "Vacuum Zone #2 — interpolated flip level",
+            "vacuum_zone_2_bull":      "Vacuum Zone #2 — bull probability 0–100",
+            "vacuum_zone_2_bear":      "Vacuum Zone #2 — bear probability 0–100",
+            "vacuum_zone_2_score":     "Vacuum Zone #2 — final confidence score",
+            "vacuum_zone_3_strike":    "Vacuum Zone #3 — interpolated flip level",
+            "vacuum_zone_3_bull":      "Vacuum Zone #3 — bull probability 0–100",
+            "vacuum_zone_3_bear":      "Vacuum Zone #3 — bear probability 0–100",
+            "trap_door_1_strike":      "Trap Door #1 — interpolated flip level",
+            "trap_door_1_magnitude":   "Trap Door #1 — zone strength (avg |net_vanna| B)",
+            "trap_door_1_dist_pct":    "Trap Door #1 — distance from spot as % of spot",
+            "trap_door_1_bull":        "Trap Door #1 — bull probability 0–100",
+            "trap_door_1_bear":        "Trap Door #1 — bear probability 0–100",
+            "trap_door_1_score":       "Trap Door #1 — final confidence score",
+            "trap_door_1_dir":         "Trap Door #1 — BULLISH / BEARISH / CONFLICTED",
+            "trap_door_2_strike":      "Trap Door #2 — interpolated flip level",
+            "trap_door_2_bull":        "Trap Door #2 — bull probability 0–100",
+            "trap_door_2_bear":        "Trap Door #2 — bear probability 0–100",
+            "trap_door_2_score":       "Trap Door #2 — final confidence score",
+            "trap_door_3_strike":      "Trap Door #3 — interpolated flip level",
+            "support_floor_1_strike":  "Support Floor #1 — interpolated flip level",
+            "support_floor_1_magnitude":"Support Floor #1 — zone strength (avg |net_vanna| B)",
+            "support_floor_1_dist_pct":"Support Floor #1 — distance from spot as % of spot",
+            "support_floor_1_bull":    "Support Floor #1 — bull probability 0–100",
+            "support_floor_1_bear":    "Support Floor #1 — bear probability 0–100",
+            "support_floor_1_score":   "Support Floor #1 — final confidence score",
+            "support_floor_1_dir":     "Support Floor #1 — BULLISH / BEARISH / CONFLICTED",
+            "support_floor_2_strike":  "Support Floor #2 — interpolated flip level",
+            "support_floor_2_bull":    "Support Floor #2 — bull probability 0–100",
+            "support_floor_2_bear":    "Support Floor #2 — bear probability 0–100",
+            "resistance_ceil_1_strike":"Resistance Ceiling #1 — interpolated flip level",
+            "resistance_ceil_1_magnitude":"Resistance Ceiling #1 — zone strength (avg |net_vanna| B)",
+            "resistance_ceil_1_dist_pct":"Resistance Ceiling #1 — distance from spot as % of spot",
+            "resistance_ceil_1_bull":  "Resistance Ceiling #1 — bull probability 0–100",
+            "resistance_ceil_1_bear":  "Resistance Ceiling #1 — bear probability 0–100",
+            "resistance_ceil_1_score": "Resistance Ceiling #1 — final confidence score",
+            "resistance_ceil_1_dir":   "Resistance Ceiling #1 — BULLISH / BEARISH / CONFLICTED",
+            "resistance_ceil_2_strike":"Resistance Ceiling #2 — interpolated flip level",
+            "resistance_ceil_2_bull":  "Resistance Ceiling #2 — bull probability 0–100",
+            "resistance_ceil_2_bear":  "Resistance Ceiling #2 — bear probability 0–100",
+            # Weighted aggregate probability (all zones combined)
+            "prob_bull":          "Weighted avg bull score across ALL zones (weight = final_score)",
+            "prob_bear":          "Weighted avg bear score across ALL zones (weight = final_score)",
+            "prob_direction":     "BULLISH / BEARISH / CONFLICTED / NEUTRAL — aggregate signal",
+            "prob_confidence":    "|avg_bull − avg_bear| — 0=no signal, 100=max conviction",
+            "prob_n_zones":       "Total VANNA flip zones detected at this bar",
+            "prob_n_bull_zones":  "Number of zones individually voting BULLISH",
+            "prob_n_bear_zones":  "Number of zones individually voting BEARISH",
+        }
+
+        # ── Available symbols ─────────────────────────────────────────────────
         con = sqlite3.connect(DB_PATH)
-        avail_exp = pd.read_sql_query(
-            "SELECT DISTINCT symbol, trade_date FROM raw_chain ORDER BY symbol, trade_date",
-            con)
+        avail_raw = pd.read_sql_query(
+            "SELECT DISTINCT symbol, trade_date FROM raw_chain ORDER BY symbol, trade_date", con)
+        avail_drv = pd.read_sql_query(
+            "SELECT DISTINCT symbol, trade_date FROM derived_snapshots ORDER BY symbol, trade_date", con)
         con.close()
 
-        if avail_exp.empty:
-            st.info("No data to export yet.")
+        if avail_raw.empty and avail_drv.empty:
+            st.info("No data available yet. Collect data first.")
         else:
-            exp_cols = st.columns(3)
-            exp_symbol = exp_cols[0].selectbox(
-                "Symbol", sorted(avail_exp["symbol"].unique()), key="exp_sym")
-            dates_for_sym = sorted(
-                avail_exp[avail_exp["symbol"] == exp_symbol]["trade_date"].unique())
-            exp_from = exp_cols[1].selectbox(
-                "From Date", dates_for_sym, key="exp_from")
-            exp_to   = exp_cols[2].selectbox(
-                "To Date", dates_for_sym,
-                index=len(dates_for_sym) - 1, key="exp_to")
+            # ── Export type selector ──────────────────────────────────────────
+            export_type = st.radio(
+                "Export type",
+                ["📊 Raw Chain (per strike per bar)",
+                 "⚗️ Derived Snapshots (per bar — all calculated metrics)",
+                 "🔗 Combined (Raw + Derived joined on date + timestamp)"],
+                horizontal=True)
 
-            export_cols = st.multiselect(
-                "Columns to export (leave empty = all)",
-                options=[
-                    "symbol", "trade_date", "timestamp",
-                    "strike_type", "strike", "spot_price",
-                    "call_oi", "put_oi", "call_oi_chg", "put_oi_chg",
-                    "call_vol", "put_vol",
-                    "call_iv", "put_iv",
-                    "call_ltp", "put_ltp",
-                    "call_gex", "put_gex", "net_gex",
-                    "call_vanna", "put_vanna", "net_vanna",
-                    "call_gamma", "put_gamma",
-                    "call_vanna_greek", "put_vanna_greek",
-                ],
-                default=[])
+            is_raw     = export_type.startswith("📊")
+            is_derived = export_type.startswith("⚗️")
+            is_combined = export_type.startswith("🔗")
 
-            if st.button("📦 Prepare Export", type="primary",
-                         use_container_width=True):
-                con = sqlite3.connect(DB_PATH)
-                df_exp = pd.read_sql_query("""
-                    SELECT * FROM raw_chain
-                    WHERE symbol=? AND trade_date>=? AND trade_date<=?
-                    ORDER BY trade_date, timestamp, strike""",
-                    con, params=(exp_symbol, exp_from, exp_to))
-                con.close()
+            avail_use  = avail_raw if (is_raw or is_combined) else avail_drv
+            col_defs   = RAW_COLS if is_raw else DERIVED_COLS
 
-                if export_cols:
-                    avail_ec = [c for c in export_cols if c in df_exp.columns]
-                    df_exp   = df_exp[avail_ec]
+            if avail_use.empty:
+                st.warning("No data of this type available yet.")
+            else:
+                st.markdown("---")
 
-                n_rows = len(df_exp)
-                n_days = df_exp["trade_date"].nunique() if "trade_date" in df_exp else "?"
-                st.markdown(
-                    f'<div class="ok-box">✅ Ready: <b>{n_rows:,} rows</b> '
-                    f'across <b>{n_days} days</b></div>',
-                    unsafe_allow_html=True)
+                # ── Symbol + date range ───────────────────────────────────────
+                hc1, hc2, hc3 = st.columns(3)
+                exp_symbol = hc1.selectbox(
+                    "Symbol", sorted(avail_use["symbol"].unique()), key="exp_sym")
+                dates_for_sym = sorted(
+                    avail_use[avail_use["symbol"] == exp_symbol]["trade_date"].unique())
+                exp_from = hc2.selectbox("From Date", dates_for_sym, key="exp_from")
+                exp_to   = hc3.selectbox(
+                    "To Date", dates_for_sym,
+                    index=len(dates_for_sym) - 1, key="exp_to")
 
-                csv_bytes = df_exp.to_csv(index=False).encode("utf-8")
-                fname     = (f"hedgex_raw_{exp_symbol}_"
-                             f"{exp_from}_to_{exp_to}.csv")
-                st.download_button(
-                    label=f"⬇️ Download {fname}",
-                    data=csv_bytes,
-                    file_name=fname,
-                    mime="text/csv",
-                    use_container_width=True)
+                n_days_sel = len([d for d in dates_for_sym
+                                  if exp_from <= d <= exp_to])
+                st.caption(f"📅 {n_days_sel} trading days selected "
+                           f"({exp_from} → {exp_to})")
 
-                st.markdown("#### Preview (first 50 rows)")
-                st.dataframe(df_exp.head(50),
-                             use_container_width=True, hide_index=True)
+                st.markdown("---")
+
+                # ── Column selector ───────────────────────────────────────────
+                st.markdown("#### 🗂️ Select Columns to Export")
+                st.caption("Leave empty = export ALL columns. "
+                           "Hover over column names to see descriptions.")
+
+                # Build display labels with description
+                col_options   = list(col_defs.keys())
+                col_labels    = {c: f"{c}  —  {col_defs[c]}" for c in col_options}
+
+                # Group selectors for quick selection
+                grp_col1, grp_col2, grp_col3 = st.columns(3)
+
+                if is_raw:
+                    grp_sel = grp_col1.selectbox(
+                        "Quick select group", [
+                            "— None —",
+                            "Identity only",
+                            "OI + Volume",
+                            "IV + LTP",
+                            "GEX columns",
+                            "VANNA columns",
+                            "Raw Greeks",
+                            "All columns",
+                        ], key="exp_grp")
+                    QUICK_RAW = {
+                        "Identity only":  ["symbol","trade_date","timestamp","strike","spot_price"],
+                        "OI + Volume":    ["symbol","trade_date","timestamp","strike","spot_price",
+                                           "call_oi","put_oi","call_oi_chg","put_oi_chg",
+                                           "call_vol","put_vol"],
+                        "IV + LTP":       ["symbol","trade_date","timestamp","strike","spot_price",
+                                           "call_iv","put_iv","call_ltp","put_ltp"],
+                        "GEX columns":    ["symbol","trade_date","timestamp","strike","spot_price",
+                                           "call_gex","put_gex","net_gex"],
+                        "VANNA columns":  ["symbol","trade_date","timestamp","strike","spot_price",
+                                           "call_vanna","put_vanna","net_vanna"],
+                        "Raw Greeks":     ["symbol","trade_date","timestamp","strike","spot_price",
+                                           "call_gamma","put_gamma","call_vanna_greek","put_vanna_greek"],
+                        "All columns":    col_options,
+                    }
+                    quick_default = QUICK_RAW.get(grp_sel, [])
+                else:
+                    grp_sel = grp_col1.selectbox(
+                        "Quick select group", [
+                            "— None —",
+                            "Identity only",
+                            "IV metrics",
+                            "OI metrics",
+                            "GEX derivatives",
+                            "VANNA zones",
+                            "Flow VANNA",
+                            "Cascade math",
+                            "Charm",
+                            "All columns",
+                        ], key="exp_grp")
+                    QUICK_DRV = {
+                        "Identity only":   ["symbol","trade_date","timestamp","spot_price"],
+                        "IV metrics":      ["symbol","trade_date","timestamp","spot_price",
+                                            "avg_iv","atm_iv","iv_skew","iv_change",
+                                            "iv_regime","iv_term_structure"],
+                        "OI metrics":      ["symbol","trade_date","timestamp","spot_price",
+                                            "total_call_oi","total_put_oi","pcr_oi","pcr_volume",
+                                            "max_pain","call_oi_concentration",
+                                            "put_oi_concentration","oi_buildup_signal"],
+                        "GEX derivatives": ["symbol","trade_date","timestamp","spot_price",
+                                            "net_gex_total","cumulative_gex_above",
+                                            "cumulative_gex_below","gex_flip_level",
+                                            "gex_skew","largest_gex_strike"],
+                        "VANNA zones":     ["symbol","trade_date","timestamp","spot_price",
+                                            "net_vanna_total","vacuum_zone_level",
+                                            "trap_door_level","support_floor_level",
+                                            "resistance_ceil_level","vanna_skew"],
+                        "Flow VANNA":      ["symbol","trade_date","timestamp","spot_price",
+                                            "net_flow_vanna_total","iv_regime"],
+                        "Cascade math":    ["symbol","trade_date","timestamp","spot_price",
+                                            "bear_fuel_pts","bear_absorb_pts",
+                                            "bull_fuel_pts","bull_absorb_pts",
+                                            "bear_quality","bull_quality",
+                                            "cascade_direction","estimated_cascade_pts"],
+                        "Charm":           ["symbol","trade_date","timestamp","spot_price",
+                                            "net_charm_total","iv_regime","cascade_direction"],
+                        "Probability":     ["symbol","trade_date","timestamp","spot_price",
+                                            "iv_regime",
+                                            "prob_bull","prob_bear","prob_direction",
+                                            "prob_confidence","prob_n_zones",
+                                            "prob_n_bull_zones","prob_n_bear_zones"],
+                        "VANNA Zones Detail": ["symbol","trade_date","timestamp","spot_price",
+                                            "iv_regime",
+                                            "vacuum_zone_1_strike","vacuum_zone_1_bull",
+                                            "vacuum_zone_1_bear","vacuum_zone_1_score",
+                                            "vacuum_zone_1_dir","vacuum_zone_1_dist_pct",
+                                            "trap_door_1_strike","trap_door_1_bull",
+                                            "trap_door_1_bear","trap_door_1_score",
+                                            "trap_door_1_dir","trap_door_1_dist_pct",
+                                            "support_floor_1_strike","support_floor_1_bull",
+                                            "support_floor_1_bear","support_floor_1_score",
+                                            "resistance_ceil_1_strike","resistance_ceil_1_bull",
+                                            "resistance_ceil_1_bear","resistance_ceil_1_score"],
+                        "All columns":     col_options,
+                    }
+                    quick_default = QUICK_DRV.get(grp_sel, [])
+
+                # Multi-select with description labels
+                export_cols_sel = st.multiselect(
+                    "Columns (leave empty = all)",
+                    options=col_options,
+                    format_func=lambda c: col_labels.get(c, c),
+                    default=quick_default if grp_sel != "— None —" else [],
+                    key="exp_cols_ms")
+
+                # Show column count
+                n_cols_export = len(export_cols_sel) if export_cols_sel else len(col_options)
+                st.caption(f"Will export {n_cols_export} columns")
+
+                st.markdown("---")
+
+                # ── Build + Download ──────────────────────────────────────────
+                if st.button("📦 Prepare & Download", type="primary",
+                             use_container_width=True):
+                    with st.spinner("Loading data from database…"):
+                        con = sqlite3.connect(DB_PATH)
+
+                        if is_raw:
+                            df_exp = pd.read_sql_query("""
+                                SELECT * FROM raw_chain
+                                WHERE symbol=? AND trade_date>=? AND trade_date<=?
+                                ORDER BY trade_date, timestamp, strike""",
+                                con, params=(exp_symbol, exp_from, exp_to))
+
+                        elif is_derived:
+                            df_exp = pd.read_sql_query("""
+                                SELECT * FROM derived_snapshots
+                                WHERE symbol=? AND trade_date>=? AND trade_date<=?
+                                  AND expiry_code=? AND expiry_flag=? AND interval_min=?
+                                ORDER BY trade_date, timestamp""",
+                                con, params=(exp_symbol, exp_from, exp_to,
+                                             expiry_code, expiry_flag, interval_min))
+
+                        else:  # combined
+                            df_raw = pd.read_sql_query("""
+                                SELECT * FROM raw_chain
+                                WHERE symbol=? AND trade_date>=? AND trade_date<=?
+                                ORDER BY trade_date, timestamp, strike""",
+                                con, params=(exp_symbol, exp_from, exp_to))
+                            df_drv = pd.read_sql_query("""
+                                SELECT * FROM derived_snapshots
+                                WHERE symbol=? AND trade_date>=? AND trade_date<=?
+                                  AND expiry_code=? AND expiry_flag=? AND interval_min=?
+                                ORDER BY trade_date, timestamp""",
+                                con, params=(exp_symbol, exp_from, exp_to,
+                                             expiry_code, expiry_flag, interval_min))
+                            # Join on trade_date + timestamp
+                            # raw: per strike per bar  →  derived: per bar
+                            # Left join so raw keeps all strikes, derived cols repeat per bar
+                            drv_nocols = [c for c in df_drv.columns
+                                          if c not in ("id","symbol","trade_date",
+                                                        "expiry_code","expiry_flag",
+                                                        "interval_min","spot_price")]
+                            df_exp = df_raw.merge(
+                                df_drv[["trade_date","timestamp"] + drv_nocols],
+                                on=["trade_date","timestamp"],
+                                how="left")
+
+                        con.close()
+
+                    if df_exp.empty:
+                        st.warning("No data found for this selection. "
+                                   "Check that derivatives have been computed first.")
+                    else:
+                        # Apply column filter
+                        if export_cols_sel:
+                            valid_cols = [c for c in export_cols_sel if c in df_exp.columns]
+                            df_exp = df_exp[valid_cols]
+
+                        # Drop internal DB id column
+                        if "id" in df_exp.columns:
+                            df_exp = df_exp.drop(columns=["id"])
+
+                        n_rows = len(df_exp)
+                        n_days_out = df_exp["trade_date"].nunique() if "trade_date" in df_exp else "?"
+                        n_cols_out = len(df_exp.columns)
+
+                        mc1, mc2, mc3 = st.columns(3)
+                        mc1.markdown(
+                            f'<div class="metric-card"><div class="metric-val">'
+                            f'{n_rows:,}</div>'
+                            f'<div class="metric-lbl">Total Rows</div></div>',
+                            unsafe_allow_html=True)
+                        mc2.markdown(
+                            f'<div class="metric-card"><div class="metric-val">'
+                            f'{n_days_out}</div>'
+                            f'<div class="metric-lbl">Trading Days</div></div>',
+                            unsafe_allow_html=True)
+                        mc3.markdown(
+                            f'<div class="metric-card"><div class="metric-val">'
+                            f'{n_cols_out}</div>'
+                            f'<div class="metric-lbl">Columns</div></div>',
+                            unsafe_allow_html=True)
+
+                        st.markdown("")
+
+                        type_tag  = ("raw" if is_raw
+                                     else "derived" if is_derived
+                                     else "combined")
+                        fname     = (f"hedgex_{type_tag}_{exp_symbol}_"
+                                     f"{exp_from}_to_{exp_to}.csv")
+                        csv_bytes = df_exp.to_csv(index=False).encode("utf-8")
+
+                        st.download_button(
+                            label=f"⬇️ Download  {fname}  ({n_rows:,} rows · {n_cols_out} cols)",
+                            data=csv_bytes,
+                            file_name=fname,
+                            mime="text/csv",
+                            use_container_width=True,
+                            type="primary")
+
+                        st.markdown("#### Preview (first 50 rows)")
+                        st.dataframe(df_exp.head(50),
+                                     use_container_width=True,
+                                     hide_index=True)
+
+                        # Column reference table
+                        with st.expander("📖 Column Reference"):
+                            ref_rows = []
+                            for c in df_exp.columns:
+                                desc = (RAW_COLS.get(c)
+                                        or DERIVED_COLS.get(c)
+                                        or "—")
+                                ref_rows.append({"Column": c, "Description": desc})
+                            st.dataframe(pd.DataFrame(ref_rows),
+                                         use_container_width=True,
+                                         hide_index=True,
+                                         height=350)
 
     # ═════════════════════════════════════════════════════════════════════════
     # TAB 5 — API Inspector
