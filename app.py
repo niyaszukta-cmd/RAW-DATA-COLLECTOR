@@ -1424,15 +1424,26 @@ def main():
                         x=df_deriv["timestamp"], y=df_deriv["atm_iv"],
                         name="ATM IV", line=dict(color="#a78bfa", width=2,
                                                   dash="dash")))
-                    # Colour background by iv_regime
-                    for _, row in df_deriv.iterrows():
-                        c = ("#ef444422" if row["iv_regime"] == "EXPANDING"
-                             else "#10b98122" if row["iv_regime"] == "COMPRESSING"
-                             else "#94a3b811")
-                        fig_iv.add_vrect(
-                            x0=row["timestamp"] - pd.Timedelta(minutes=2),
-                            x1=row["timestamp"] + pd.Timedelta(minutes=2),
-                            fillcolor=c, layer="below", line_width=0)
+                    # Colour background by iv_regime using a bar trace (avoids vrect rgba issues)
+                    _regime_color_map = {
+                        "EXPANDING":   "rgba(239,68,68,0.13)",
+                        "COMPRESSING": "rgba(16,185,129,0.13)",
+                        "FLAT":        "rgba(148,163,184,0.06)",
+                    }
+                    for regime, rcolor in _regime_color_map.items():
+                        _mask = df_deriv["iv_regime"] == regime
+                        if _mask.any():
+                            fig_iv.add_trace(go.Bar(
+                                x=df_deriv.loc[_mask, "timestamp"],
+                                y=[df_deriv["avg_iv"].max() * 1.5] * _mask.sum(),
+                                marker_color=rcolor,
+                                marker_line_width=0,
+                                width=[pd.Timedelta(minutes=4).total_seconds() * 1000] * _mask.sum(),
+                                showlegend=False,
+                                hoverinfo="skip",
+                                yaxis="y",
+                            ))
+                    fig_iv.update_layout(barmode="overlay")
                     fig_iv.update_layout(
                         template="plotly_dark", height=350,
                         paper_bgcolor="rgba(0,0,0,0)",
